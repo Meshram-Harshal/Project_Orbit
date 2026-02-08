@@ -1,0 +1,25 @@
+{
+  "name": "orbit-wallet-bot",
+  "version": "1.0.0",
+  "description": "Telegram custodial wallet bot for Monad EVM chain",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js"
+  },
+  "keywords": [
+    "telegram",
+    "wallet",
+    "monad",
+    "evm",
+    "custodial"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "dotenv": "^17.2.4",
+    "ethers": "^6.16.0",
+    "mongoose": "^9.1.6",
+    "node-telegram-bot-api": "^0.67.0",
+    "winston": "^3.19.0"
+  }
+}
