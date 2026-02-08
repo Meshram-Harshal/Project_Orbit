@@ -4,6 +4,7 @@ const { connectDB } = require('./db/connection');
 const { registerCommands } = require('./bot/commands');
 const { registerCallbacks } = require('./bot/callbacks');
 const { monitorIncoming } = require('./services/blockchain');
+const { startRebalanceCron, stopRebalanceCron } = require('./services/rebalanceCron');
 const User = require('./db/models/User');
 const logger = require('./utils/logger');
 
@@ -32,11 +33,14 @@ async function main() {
     logger.error('Error starting transfer monitors:', err);
   }
 
+  startRebalanceCron();
+
   logger.info('Orbit Wallet Bot is running');
 
   // Graceful shutdown
   const shutdown = async (signal) => {
     logger.info(`Received ${signal}. Shutting down...`);
+    stopRebalanceCron();
     bot.stopPolling();
     const mongoose = require('mongoose');
     await mongoose.connection.close();

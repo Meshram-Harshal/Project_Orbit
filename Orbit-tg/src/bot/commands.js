@@ -20,7 +20,11 @@ function registerCommands(bot) {
             { text: '📤 Export Wallet', callback_data: 'export_wallet' },
             { text: '💰 Balance', callback_data: 'balance' },
           ],
-          [{ text: '💸 Send Tokens', callback_data: 'send_tokens' }],
+          [
+            { text: '💸 Send Tokens', callback_data: 'send_tokens' },
+            { text: '📈 Open Position', callback_data: 'open_position' },
+          ],
+          [{ text: '📉 Close Position', callback_data: 'close_position' }],
         ],
       },
     };

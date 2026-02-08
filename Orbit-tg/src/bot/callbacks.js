@@ -2,6 +2,11 @@ const { ethers } = require('ethers');
 const { isAllowed } = require('../utils/rateLimit');
 const { createWallet, importWallet, exportWallet, getUser } = require('../services/wallet');
 const { getBalance, getTokenBalance, sendNative, sendToken } = require('../services/blockchain');
+const { openPositionSingleSidedMon, fetchCurrentTick, burnPositionOnly } = require('../services/lpService');
+const { decrypt } = require('../services/crypto');
+const config = require('../config');
+const OpenPosition = require('../db/models/OpenPosition');
+const User = require('../db/models/User');
 const logger = require('../utils/logger');
 
 // Track users in multi-step flows: telegramId -> { state, data }
@@ -50,6 +55,24 @@ function registerCallbacks(bot) {
         case 'send_erc20':
           await handleSendERC20Start(bot, chatId, telegramId);
           break;
+        case 'open_position':
+          await handleOpenPosition(bot, chatId, telegramId);
+          break;
+        case 'lp_pair_mon_ausd':
+          await handleLpPairMonAusd(bot, chatId, telegramId);
+          break;
+        case 'lp_single_sided':
+          await handleLpSingleSided(bot, chatId, telegramId);
+          break;
+        case 'close_position':
+          await handleClosePositionList(bot, chatId, telegramId);
+          break;
+        default:
+          if (action.startsWith('close_position_')) {
+            const positionId = action.replace('close_position_', '');
+            await handleClosePositionConfirm(bot, chatId, telegramId, positionId);
+          }
+          break;
       }
     } catch (err) {
       logger.error(`Callback error [${action}]:`, err);
@@ -86,6 +109,12 @@ function registerCallbacks(bot) {
           break;
         case 'send_erc20_amount':
           await handleSendERC20Amount(bot, msg, telegramId);
+          break;
+        case 'open_position_mon_amount':
+          await handleOpenPositionMonAmount(bot, msg, telegramId);
+          break;
+        case 'open_position_tick_range':
+          await handleOpenPositionTickRange(bot, msg, telegramId);
           break;
       }
     } catch (err) {
@@ -360,6 +389,214 @@ async function handleSendERC20Amount(bot, msg, telegramId) {
       parse_mode: 'Markdown',
     }
   );
+}
+
+// --- Open Position (MON/AUSD single-sided) ---
+async function handleOpenPosition(bot, chatId, telegramId) {
+  const user = await getUser(telegramId);
+  if (!user) {
+    return bot.sendMessage(chatId, 'No wallet found. Create or import one first.');
+  }
+
+  const keyboard = {
+    reply_markup: {
+      inline_keyboard: [[{ text: 'MON / AUSD', callback_data: 'lp_pair_mon_ausd' }]],
+    },
+  };
+  bot.sendMessage(chatId, 'Choose pair:', keyboard);
+}
+
+async function handleLpPairMonAusd(bot, chatId, telegramId) {
+  const keyboard = {
+    reply_markup: {
+      inline_keyboard: [
+        [{ text: 'Single sided liquidity', callback_data: 'lp_single_sided' }],
+        [{ text: 'Double sided liquidity', callback_data: 'lp_double_sided', disabled: true }],
+      ],
+    },
+  };
+  bot.sendMessage(chatId, 'MON/AUSD – choose type (double sided coming soon):', keyboard);
+}
+
+async function handleLpSingleSided(bot, chatId, telegramId) {
+  userStates.set(telegramId, { step: 'open_position_mon_amount' });
+  bot.sendMessage(
+    chatId,
+    '📈 *Single sided LP*\n\nSend the MON amount you want to deposit (e.g. `1` or `0.5`).',
+    { parse_mode: 'Markdown' }
+  );
+}
+
+async function handleOpenPositionMonAmount(bot, msg, telegramId) {
+  const chatId = msg.chat.id;
+  const amountStr = msg.text.trim();
+
+  let monAmountWei;
+  try {
+    monAmountWei = ethers.parseEther(amountStr);
+  } catch {
+    return bot.sendMessage(chatId, '❌ Invalid amount. Send a number (e.g. 1 or 0.5):');
+  }
+  if (monAmountWei <= 0n) {
+    return bot.sendMessage(chatId, '❌ Amount must be greater than 0.');
+  }
+
+  userStates.set(telegramId, {
+    step: 'open_position_tick_range',
+    monAmountWei: monAmountWei.toString(),
+  });
+  bot.sendMessage(
+    chatId,
+    'Send tick range (e.g. `20` → lower = current+1, upper = current+20):'
+  );
+}
+
+async function handleOpenPositionTickRange(bot, msg, telegramId) {
+  const chatId = msg.chat.id;
+  const state = userStates.get(telegramId);
+  if (!state || state.step !== 'open_position_tick_range') return;
+
+  const tickRangeStr = msg.text.trim();
+  const tickRange = parseInt(tickRangeStr, 10);
+  if (!Number.isInteger(tickRange) || tickRange < 1) {
+    return bot.sendMessage(chatId, '❌ Invalid tick range. Send a positive number (e.g. 20):');
+  }
+
+  userStates.delete(telegramId);
+
+  const user = await getUser(telegramId);
+  if (!user) {
+    return bot.sendMessage(chatId, 'No wallet found.');
+  }
+
+  const privateKey = decrypt(
+    {
+      ciphertext: user.encryptedPrivateKey,
+      iv: user.iv,
+      authTag: user.authTag,
+      salt: user.salt,
+    },
+    config.ENCRYPTION_KEY
+  );
+
+  const sent = await bot.sendMessage(chatId, '⏳ Creating position...');
+
+  try {
+    const currentTick = await fetchCurrentTick();
+    const tickLower = currentTick - tickRange;
+    const tickUpper = currentTick + tickRange;
+
+    const monAmountWei = BigInt(state.monAmountWei);
+    const ausdAmountWei = BigInt(state.ausdAmountWei);
+    const { positionId, ownerAddress } = await openPositionDoubleSided(
+      privateKey,
+      monAmountWei,
+      ausdAmountWei,
+      tickLower,
+      tickUpper
+    );
+
+    await OpenPosition.create({
+      telegramId,
+      walletAddress: ownerAddress,
+      positionId,
+      tickLower,
+      tickUpper,
+      tickRange,
+      totalFeesEarned: '0',
+      valueInMon: ethers.formatEther(monAmountWei),
+    });
+
+    await bot.editMessageText(
+      `✅ *Position opened*\n\n` +
+        `Position ID: \`${positionId}\`\n` +
+        `Range: ${tickLower} – ${tickUpper}\n` +
+        `MON: ${ethers.formatEther(monAmountWei)} | AUSD: ${ethers.formatUnits(ausdAmountWei, 6)}\n\n` +
+        `We check every minute and rebalance if price moves out of range.`,
+      {
+        chat_id: chatId,
+        message_id: sent.message_id,
+        parse_mode: 'Markdown',
+      }
+    );
+  } catch (err) {
+    logger.error('Open position error:', err);
+    await bot.editMessageText(`❌ Failed: ${err.message}`, {
+      chat_id: chatId,
+      message_id: sent.message_id,
+    });
+  }
+}
+
+// --- Close Position ---
+async function handleClosePositionList(bot, chatId, telegramId) {
+  const positions = await OpenPosition.find({ telegramId }).sort({ createdAt: -1 });
+  if (positions.length === 0) {
+    return bot.sendMessage(chatId, 'You have no open positions.');
+  }
+
+  const keyboard = {
+    reply_markup: {
+      inline_keyboard: positions.map((p) => [
+        {
+          text: `#${p.positionId} (${p.tickLower}–${p.tickUpper})`,
+          callback_data: `close_position_${p.positionId}`,
+        },
+      ]),
+    },
+  };
+  bot.sendMessage(chatId, 'Select position to close:', keyboard);
+}
+
+async function handleClosePositionConfirm(bot, chatId, telegramId, positionId) {
+  const position = await OpenPosition.findOne({ positionId, telegramId });
+  if (!position) {
+    return bot.sendMessage(chatId, 'Position not found.');
+  }
+
+  const user = await getUser(telegramId);
+  if (!user) {
+    return bot.sendMessage(chatId, 'No wallet found.');
+  }
+  // Only the wallet that opened the position can burn it (NotApproved otherwise)
+  if (user.walletAddress.toLowerCase() !== position.walletAddress.toLowerCase()) {
+    return bot.sendMessage(
+      chatId,
+      'This position was opened with a different wallet. Only that wallet can close it. If you re-imported, use the original wallet.'
+    );
+  }
+
+  const privateKey = decrypt(
+    {
+      ciphertext: user.encryptedPrivateKey,
+      iv: user.iv,
+      authTag: user.authTag,
+      salt: user.salt,
+    },
+    config.ENCRYPTION_KEY
+  );
+
+  const sent = await bot.sendMessage(chatId, '⏳ Withdrawing position...');
+
+  try {
+    await burnPositionOnly(privateKey, positionId);
+    await OpenPosition.deleteOne({ positionId, telegramId });
+
+    await bot.editMessageText(
+      `✅ *Position closed*\n\nPosition \`${positionId}\` withdrawn. Tokens sent to your wallet.`,
+      {
+        chat_id: chatId,
+        message_id: sent.message_id,
+        parse_mode: 'Markdown',
+      }
+    );
+  } catch (err) {
+    logger.error('Close position error:', err);
+    await bot.editMessageText(`❌ Failed: ${err.message}`, {
+      chat_id: chatId,
+      message_id: sent.message_id,
+    });
+  }
 }
 
 module.exports = { registerCallbacks };
