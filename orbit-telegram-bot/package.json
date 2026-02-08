@@ -1,0 +1,21 @@
+{
+  "name": "orbit-telegram-bot",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "tsx src/index.ts",
+    "build": "tsc",
+    "db:reset": "tsx src/scripts/drop-db.ts"
+  },
+  "dependencies": {
+    "dotenv": "^16.3.1",
+    "grammy": "^1.21.1",
+    "mongoose": "^8.0.3",
+    "viem": "^2.21.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.10.0",
+    "tsx": "^4.7.0",
+    "typescript": "^5.3.3"
+  }
+}
